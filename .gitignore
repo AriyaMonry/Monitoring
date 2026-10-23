@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+state.json
+state.json.corrupt
+config.ini
+*.tmp
