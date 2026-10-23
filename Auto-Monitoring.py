@@ -36,6 +36,7 @@ import grp
 import ipaddress
 import json
 import logging
+import math
 import os
 import pwd
 import re
@@ -101,6 +102,13 @@ STANDARD_SBIN_PATHS = (
     "/bin",
 )
 
+# A timed-out statvfs call cannot be interrupted from Python. Keep at most one
+# background worker per mount and cap the total number of quarantined workers so
+# a permanently hung filesystem cannot create an unbounded thread leak.
+MOUNT_PROBE_MAX_ACTIVE_THREADS = 64
+_MOUNT_PROBE_LOCK = threading.Lock()
+_MOUNT_PROBE_ACTIVE: dict[str, threading.Thread] = {}
+
 
 def ensure_standard_path() -> None:
     """Ensure standard Linux bin/sbin directories are present in PATH.
@@ -108,12 +116,10 @@ def ensure_standard_path() -> None:
     Called from `main()` and `ensure_dependencies()` rather than at import time
     to avoid global environment side effects when the module is imported by tests.
     """
-    current = os.environ.get("PATH", "")
-    parts = [p for p in current.split(os.pathsep) if p]
-    for directory in STANDARD_SBIN_PATHS:
-        if directory not in parts:
-            parts.append(directory)
-    os.environ["PATH"] = os.pathsep.join(parts)
+    # This process invokes system tools as root during installation. Preserving
+    # an attacker-controlled PATH would allow a shadowed `apt-get`, `systemctl`,
+    # or `useradd` to execute with full privileges.
+    os.environ["PATH"] = os.pathsep.join(STANDARD_SBIN_PATHS)
 
 
 def get_cpu_count() -> int:
@@ -577,7 +583,11 @@ def load_config(path: Path = CONFIG_PATH) -> dict[str, Any]:
     if not path.exists():
         return default_config()
     parser = configparser.ConfigParser(interpolation=None)
-    parser.read(path, encoding="utf8")
+    # ConfigParser.read() silently skips unreadable files. That could make a
+    # live daemon fall back to defaults (including stdout alerts) after a
+    # permission or I/O problem, so open the file explicitly.
+    with path.open("r", encoding="utf8") as handle:
+        parser.read_file(handle)
     cfg = dict_from_parser(parser)
     validate_config(cfg)
     return cfg
@@ -1468,6 +1478,25 @@ def enqueue_alert(state: dict[str, Any], title: str, body: str, severity: str = 
         del outbox[:overflow]
 
 
+def _normalize_outbox_item(item: Any, now: float) -> dict[str, Any] | None:
+    """Return a safe outbox item, or None when persisted data is malformed."""
+    if not isinstance(item, dict):
+        return None
+    try:
+        created = float(item.get("created", now))
+        attempts = int(item.get("attempts", 0))
+        next_try = float(item.get("next_try", 0.0))
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not math.isfinite(created) or not math.isfinite(next_try) or attempts < 0:
+        return None
+    normalized = dict(item)
+    normalized["created"] = created
+    normalized["attempts"] = attempts
+    normalized["next_try"] = next_try
+    return normalized
+
+
 def flush_outbox(
     state: dict[str, Any],
     deliver: Callable[[dict[str, Any]], bool],
@@ -1487,8 +1516,17 @@ def flush_outbox(
     if not isinstance(outbox, list):
         state["outbox"] = []
         return 0
-    valid_items = [a for a in outbox if isinstance(a, dict)]
-    fresh = [a for a in valid_items if now - float(a.get("created", now)) <= OUTBOX_MAX_AGE_SECONDS]
+    valid_items: list[dict[str, Any]] = []
+    malformed = 0
+    for item in outbox:
+        normalized = _normalize_outbox_item(item, now)
+        if normalized is None:
+            malformed += 1
+            continue
+        valid_items.append(normalized)
+    if malformed:
+        LOGGER.warning("dropped %d malformed alert(s) from the outbox", malformed)
+    fresh = [a for a in valid_items if now - a["created"] <= OUTBOX_MAX_AGE_SECONDS]
     if len(fresh) != len(valid_items):
         LOGGER.warning("dropped %d expired alert(s) from the outbox", len(valid_items) - len(fresh))
     remaining = list(fresh)
@@ -1497,7 +1535,7 @@ def flush_outbox(
     index = 0
     while index < len(remaining):
         alert = remaining[index]
-        if blocked or float(alert.get("next_try", 0.0)) > now:
+        if blocked or alert["next_try"] > now:
             index += 1
             continue
         if deliver(alert):
@@ -1510,7 +1548,7 @@ def flush_outbox(
                 except (OSError, AgentError) as exc:
                     LOGGER.warning("could not checkpoint outbox after delivery: %s", exc)
             continue
-        attempts = int(alert.get("attempts", 0)) + 1
+        attempts = alert["attempts"] + 1
         alert["attempts"] = attempts
         backoff = min(OUTBOX_BACKOFF_BASE_SECONDS * (2 ** min(attempts - 1, 10)), OUTBOX_BACKOFF_MAX_SECONDS)
         alert["next_try"] = now + backoff
@@ -1569,8 +1607,19 @@ def _probe_mount_fs(mount: str, timeout: float = MOUNT_PROBE_TIMEOUT_SECONDS) ->
 
     statvfs() on a hung NFS/ceph mount blocks indefinitely in the kernel; a
     daemon thread plus join(timeout) lets the cycle skip it and stay alive.
-    The leaked thread is a daemon, so it can never block process exit.
+    Python cannot cancel that syscall, so quarantine at most one worker per
+    mount and cap the total number of quarantined workers.
     """
+    with _MOUNT_PROBE_LOCK:
+        existing = _MOUNT_PROBE_ACTIVE.get(mount)
+        if existing is not None:
+            if existing.is_alive():
+                return None
+            _MOUNT_PROBE_ACTIVE.pop(mount, None)
+        if len(_MOUNT_PROBE_ACTIVE) >= MOUNT_PROBE_MAX_ACTIVE_THREADS:
+            LOGGER.warning("mount probe worker limit reached; skipping %s", mount)
+            return None
+
     result: list[tuple[int, os.statvfs_result]] = []
 
     def worker() -> None:
@@ -1578,8 +1627,13 @@ def _probe_mount_fs(mount: str, timeout: float = MOUNT_PROBE_TIMEOUT_SECONDS) ->
             result.append((os.stat(mount).st_dev, os.statvfs(mount)))
         except OSError:
             result.clear()
+        finally:
+            with _MOUNT_PROBE_LOCK:
+                _MOUNT_PROBE_ACTIVE.pop(mount, None)
 
     thread = threading.Thread(target=worker, daemon=True)
+    with _MOUNT_PROBE_LOCK:
+        _MOUNT_PROBE_ACTIVE[mount] = thread
     thread.start()
     thread.join(timeout)
     if thread.is_alive() or not result:
@@ -2068,6 +2122,39 @@ def record_probe_result(
             blind[probe] = True
 
 
+def update_systemd_incidents(
+    current: set[str],
+    previous: set[str],
+    tracker: ResourceIncidentTracker,
+    now: float,
+    notify: Callable[[str, str, str], None],
+) -> None:
+    """Advance failed-unit incidents, including healthy recovery samples."""
+    tracked = {
+        key.removeprefix("unit:")
+        for key in tracker.dump()
+        if str(key).startswith("unit:")
+    }
+    candidates = current | previous | tracked
+    for unit in sorted(candidates):
+        event = tracker.observe(f"unit:{unit}", unit in current, now=now)
+        if event == "triggered":
+            notify("⚙️ Service Failed", f"{unit} has failed.", "critical")
+        elif event == "relapse":
+            LOGGER.info("unit %s failed again while recovering; alert already active", unit)
+        elif event == "resolved":
+            notify("✅ Service Resolved", f"{unit} recovered successfully.", "info")
+
+    # Keep active/recovering incidents long enough to receive future healthy
+    # samples. Resolved/healthy units can be removed immediately.
+    keep: set[str] = set()
+    for unit in candidates:
+        record = tracker.state(f"unit:{unit}")
+        if unit in current or record.get("status") in {"active", "recovering"}:
+            keep.add(f"unit:{unit}")
+    tracker.prune("unit:", keep)
+
+
 # --------------------------------------------------------------------------
 # Prerequisite verification, package installation, and systemd setup
 # --------------------------------------------------------------------------
@@ -2145,7 +2232,10 @@ def install_missing_packages(missing_items: Sequence[str]) -> tuple[bool, str]:
 
     if manager == "apt-get":
         env["DEBIAN_FRONTEND"] = "noninteractive"
-        run_command(["apt-get", "update", "-qq"], timeout=120, env=env)
+        update = run_command(["apt-get", "update", "-qq"], timeout=120, env=env)
+        if update.returncode != 0:
+            detail = (update.stderr or update.stdout).strip()
+            return False, f"package index update via apt-get failed: {detail}"
         cmd = ["apt-get", "install", "-y", "--no-install-recommends", *packages]
     elif manager in {"dnf", "yum"}:
         cmd = [manager, "install", "-y", *packages]
@@ -2202,7 +2292,8 @@ def ensure_dependencies(
     missing = [binary for binary in required_binaries if not shutil.which(binary)]
 
     backend = str((cfg or {}).get("alerts", {}).get("backend", ALERT_DEFAULTS["backend"]))
-    if auto_install and backend in {"telegram", "webhook"} and not _has_ca_certificates():
+    needs_ca = backend in {"telegram", "webhook"} and not _has_ca_certificates()
+    if needs_ca:
         missing.append("ca-certificates")
 
     if not missing:
@@ -2214,6 +2305,8 @@ def ensure_dependencies(
             LOGGER.warning("%s", install_msg)
             return False, install_msg
         still_missing = [binary for binary in required_binaries if not shutil.which(binary)]
+        if needs_ca and not _has_ca_certificates():
+            still_missing.append("ca-certificates")
         if not still_missing:
             return True, install_msg
         return False, "missing required tools: " + ", ".join(still_missing)
@@ -2543,7 +2636,8 @@ def install(non_interactive: bool = False, auto_install_deps: bool = False, forc
 
         sys_check = run_command(["systemctl", "is-active", SERVICE_NAME], timeout=12)
         if sys_check.stdout.strip() != "active":
-            LOGGER.warning("service is not active yet: %s", sys_check.stdout.strip() or sys_check.stderr.strip())
+            detail = sys_check.stdout.strip() or sys_check.stderr.strip() or "unknown state"
+            raise AgentError(f"service is not active after installation: {detail}")
     except BaseException:
         print("installation failed; rolling back service changes...", file=sys.stderr)
         run_command(["systemctl", "disable", "--now", SERVICE_NAME], timeout=30)
@@ -2584,13 +2678,17 @@ def uninstall() -> int:
     """Best-effort removal of the service unit; keeps config and state for review."""
     if os.geteuid() != 0:
         raise AgentError("uninstall requires root privileges; run with sudo")
-    run_command(["systemctl", "disable", "--now", SERVICE_NAME], timeout=30)
+    stop = run_command(["systemctl", "disable", "--now", SERVICE_NAME], timeout=30)
+    if stop.returncode not in {0, 5}:  # 5 means the unit was not found.
+        raise AgentError(f"could not stop/disable {SERVICE_NAME}: {stop.stderr.strip()}")
     service_file = Path("/etc/systemd/system") / SERVICE_NAME
     try:
         service_file.unlink(missing_ok=True)
     except OSError as exc:
-        LOGGER.warning("could not remove %s: %s", service_file, exc)
-    run_command(["systemctl", "daemon-reload"], timeout=30)
+        raise AgentError(f"could not remove {service_file}: {exc}") from exc
+    reload_result = run_command(["systemctl", "daemon-reload"], timeout=30)
+    if reload_result.returncode != 0:
+        raise AgentError(f"daemon-reload failed: {reload_result.stderr.strip()}")
     if INSTALL_ROOT.exists():
         shutil.rmtree(INSTALL_ROOT, ignore_errors=True)
     print(f"Service {SERVICE_NAME} removed.")
@@ -2774,25 +2872,28 @@ def _run_cycle(cfg: dict[str, Any]) -> bool:
 
         # Disk block and inode usage probes.
         if features.get("disk", True) or features.get("inode", True):
+            mounts: list[dict[str, Any]] | None = None
             with probe_context("filesystem"):
-                mounts: list[dict[str, Any]] = get_mounts()
-            present_mounts: set[str] = set()
-            for mount in mounts:
-                present_mounts.add(mount["mount"])
-                if mount.get("error"):
-                    result = False  # statvfs failed/hung for this mount
-                    failed_probes.add("filesystem")
-                    continue
-                if features.get("disk", True):
-                    key = f"disk:{mount['mount']}"
-                    check_resource(key, float(mount["percent"]), thresholds["disk"])
-                if features.get("inode", True) and mount["inode_percent"] is not None:
-                    key = f"inode:{mount['mount']}"
-                    check_resource(key, float(mount["inode_percent"]), thresholds["inode"])
-            # Prune only mount points that truly vanished from /proc/self/mounts;
-            # a single failed statvfs must not delete an active incident.
-            tracker.prune("disk:", {f"disk:{m}" for m in present_mounts})
-            tracker.prune("inode:", {f"inode:{m}" for m in present_mounts})
+                mounts = get_mounts()
+            if mounts is not None:
+                present_mounts: set[str] = set()
+                for mount in mounts:
+                    present_mounts.add(mount["mount"])
+                    if mount.get("error"):
+                        result = False  # statvfs failed/hung for this mount
+                        failed_probes.add("filesystem")
+                        continue
+                    if features.get("disk", True):
+                        key = f"disk:{mount['mount']}"
+                        check_resource(key, float(mount["percent"]), thresholds["disk"])
+                    if features.get("inode", True) and mount["inode_percent"] is not None:
+                        key = f"inode:{mount['mount']}"
+                        check_resource(key, float(mount["inode_percent"]), thresholds["inode"])
+                # Prune only mount points that truly vanished from
+                # /proc/self/mounts; a failed probe must not delete an active
+                # incident or make the rest of the cycle crash.
+                tracker.prune("disk:", {f"disk:{m}" for m in present_mounts})
+                tracker.prune("inode:", {f"inode:{m}" for m in present_mounts})
 
         # Network traffic and interface error/drop probes.
         counters: dict[str, IfaceCounters] | None = None
@@ -2914,19 +3015,10 @@ def _run_cycle(cfg: dict[str, Any]) -> bool:
                 result = False
                 failed_probes.add("systemd")
             else:
-                for unit in sorted(current):
-                    event = tracker.observe(f"unit:{unit}", True, now=now)
-                    if event == "triggered":
-                        notify("⚙️ Service Failed", f"{unit} has failed.", "critical")
-                    elif event == "relapse":
-                        LOGGER.info("unit %s failed again while recovering; alert already active", unit)
                 raw_prev = state.get("failed_systemd_services")
                 previous = set(raw_prev) if isinstance(raw_prev, (set, list)) else set()
-                for unit in sorted(previous - current):
-                    if tracker.observe(f"unit:{unit}", False, now=now) == "resolved":
-                        notify("✅ Service Resolved", f"{unit} recovered successfully.", "info")
+                update_systemd_incidents(current, previous, tracker, now, notify)
                 state["failed_systemd_services"] = current
-                tracker.prune("unit:", {f"unit:{u}" for u in previous | current})
 
         # NTP clock synchronization check, debounced with the incident tracker and
         # granted a post-boot grace period so a normal boot never emits a
@@ -3301,6 +3393,19 @@ def run_selftest() -> int:
     ntp_events = [ntp_tracker.observe("ntp", bad, now=t) for t, bad in [(0, True), (1, True), (2, True)]]
     _expect(ntp_events == [None, None, "triggered"], "time_sync: debounce requires N consecutive bad samples")
 
+    # Failed systemd units must continue receiving healthy samples after they
+    # disappear from the current failed-unit list.
+    unit_tracker = ResourceIncidentTracker(persistence_samples=1, recovery_minutes=1)
+    unit_alerts: list[str] = []
+    notify_unit = lambda title, _body, _severity: unit_alerts.append(title)
+    update_systemd_incidents({"broken.service"}, set(), unit_tracker, 0.0, notify_unit)
+    update_systemd_incidents(set(), {"broken.service"}, unit_tracker, 60.0, notify_unit)
+    update_systemd_incidents(set(), set(), unit_tracker, 120.0, notify_unit)
+    _expect(
+        unit_alerts == ["⚙️ Service Failed", "✅ Service Resolved"],
+        "systemd: recovered units receive enough healthy samples to resolve",
+    )
+
     # Swap activity rate (P3-18).
     _expect(swap_activity_rate([10, 20], [110, 220], 100.0) == 2.0, "swap: activity rate computed from pswpin/out deltas")
     _expect(swap_activity_rate([100, 100], [90, 80], 10.0) == 0.0, "swap: counter reset counts as zero activity")
@@ -3343,6 +3448,18 @@ def run_selftest() -> int:
     _expect(
         flush_outbox(outbox_state, lambda _a: True, base + 40) == 1 and not outbox_state["outbox"],
         "outbox: delivered after recovery and then removed",
+    )
+    malformed_outbox = {
+        "outbox": [
+            {"created": "not-a-number"},
+            None,
+            {"created": base, "attempts": "invalid"},
+        ]
+    }
+    _expect(
+        flush_outbox(malformed_outbox, lambda _a: True, base + 1) == 0
+        and not malformed_outbox["outbox"],
+        "outbox: malformed persisted items are discarded without crashing",
     )
     # Per-delivery checkpoint (P3-22): save() runs after every successful send.
     checkpoint_state: dict[str, Any] = {}
@@ -3515,7 +3632,10 @@ def _drop_to_service_user() -> bool:
     except KeyError:
         return False
     try:
-        os.setgroups([])
+        # Preserve the service account's supplementary groups (notably
+        # systemd-journal) so a root-invoked `check` has the same read access as
+        # the systemd service itself.
+        os.initgroups(NAME, gid)
         os.setgid(gid)
         os.setuid(uid)
     except OSError as exc:
